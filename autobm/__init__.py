@@ -112,7 +112,7 @@ def benchmark_part(part, benchmark_config: BenchmarkConfig, config, podman_clien
 
 
 def benchmark_pr(pr, benchmark_config: BenchmarkConfig, config):
-    with PodmanClient(base_url="unix:///run/user/1000/podman/podman.sock") as client:
+    with PodmanClient(base_url=config["podman_socket"]) as client:
         results_after = benchmark_part(pr.head, benchmark_config, config, client)
         results_before = benchmark_part(pr.base, benchmark_config, config, client)
         results = {}
