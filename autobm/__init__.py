@@ -97,6 +97,7 @@ def benchmark_part(part, benchmark_config: BenchmarkConfig, config, podman_clien
     if not os.path.exists(cached_sql_path):
         with TemporaryDirectory() as sql_tmp_dir:
             sql_tmp_dir = os.path.abspath(sql_tmp_dir)
+            podman_client.images.pull(release_build_container)
             if (not build.build_sql(
                     output_dir=sql_tmp_dir,
                     gitinfo=git_info,
