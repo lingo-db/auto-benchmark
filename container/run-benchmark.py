@@ -224,9 +224,9 @@ output_file = sys.argv[5]
 
 class Runner:
     def __enter__(self):
-        self.process = Process(f"sql {db_base_dir}/{dataset}",
+        self.process = Process(f"taskset --cpu-list 0-7 sql {db_base_dir}/{dataset}",
                                {"LINGODB_EXECUTION_MODE": execution_mode, "LINGODB_SQL_PROMPT": "0",
-                                "LINGODB_SQL_REPORT_TIMES": "1"})
+                                "LINGODB_SQL_REPORT_TIMES": "1", "LINGODB_PARALLELISM": "8"})
         self.process.start()
         return self
 
@@ -280,33 +280,25 @@ with Runner() as runner:
             runner.execute(query)
         execution_times = []
         compilation_times = []
-        totals = []
         for i in range(200):
             execution_time, compilation_time, client_total = runner.execute(query)
             # print(f"Run: Execution Time: {execution_time} ms\nCompilation Time: {compilation_time} ms\nClient Total Time: {client_total} ms\n")
             execution_times.append(execution_time)
             compilation_times.append(compilation_time)
-            totals.append(execution_time + compilation_time)
             judged_execution_times = judge_stability(
                 execution_times,
-                rel_tol=0.03,
+                rel_tol=0.02,
             )
             judged_compilation_times = judge_stability(
                 compilation_times,
-                rel_tol=0.03,
+                rel_tol=0.02,
             )
-            judged_totals = judge_stability(
-                totals,
-                rel_tol=0.03,
-            )
-            if judged_execution_times.stable and judged_compilation_times.stable and judged_totals.stable:
+            if judged_execution_times.stable and judged_compilation_times.stable:
                 results["queries"][query_file.replace(".sql","")] = {
                     "execution_times": execution_times,
                     "compilation_times": compilation_times,
-                    "totals": totals,
                     "execution_time_summary": f"{judged_execution_times.estimate_ms} ms ± {judged_execution_times.plus_minus_ms} ms",
                     "compilation_time_summary":  f"{judged_compilation_times.estimate_ms} ms ± {judged_compilation_times.plus_minus_ms} ms",
-                    "total_summary": f"{judged_totals.estimate_ms} ms ± {judged_totals.plus_minus_ms} ms",
                 }
                 break
 
