@@ -58,7 +58,7 @@ def significant_speed_change_b_vs_a(
     if not boot: return None
     boot = np.asarray(boot)
     lo, hi = np.percentile(boot, [100 * alpha / 2, 100 * (1 - alpha / 2)])
-    if not (hi < 1.0) or (lo > 1.0):
+    if not ((hi < 1.0) or (lo > 1.0)):
         return None
 
     if factor > 1.0:
