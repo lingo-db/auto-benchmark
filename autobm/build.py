@@ -7,10 +7,12 @@ def build_sql(output_dir, gitinfo: GitCheckoutInfo, release_build_container, pod
         git init lingo-db
         cd lingo-db
         git remote add origin {gitinfo.repo_url}
-        git fetch --depth 1 origin {gitinfo.commit_sha}
+        git fetch origin {gitinfo.commit_sha}
         git checkout FETCH_HEAD
+        git submodule update --init --recursive
         mkdir build
-        cmake -G Ninja . -B build -DCMAKE_BUILD_TYPE=Release -DClang_DIR=/built-llvm/lib/cmake/clang -DArrow_DIR=/built-arrow/lib64/cmake/Arrow -DENABLE_TESTS=OFF
+        export PATH=/built-llvm/bin/:$PATH
+        cmake -G Ninja . -B build -DCMAKE_BUILD_TYPE=Release -DClang_DIR=/built-llvm/lib/cmake/clang -DArrow_DIR=/built-arrow/lib64/cmake/Arrow -DArrowCompute_DIR=/built-arrow/lib64/cmake/ArrowCompute -DENABLE_TESTS=OFF -DENABLE_BASELINE_BACKEND=ON
         cmake --build build -j $(nproc) --target sql
         ls build
         cp build/sql /output/sql

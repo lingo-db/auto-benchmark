@@ -246,11 +246,12 @@ for pr in open_prs:
     if needs:
         print(f"  -> Needs benchmark (requested at {req_comment.created_at.isoformat()})\n")
         benchmark_config = parse_benchmark_args(req_comment.body.strip(), config)
-        post_progress_comment(pr, req_comment, benchmark_config)
+        progress_comment = post_progress_comment(pr, req_comment, benchmark_config)
         try:
             result = benchmark_pr(pr, benchmark_config, config)
             post_results_comment(pr, result)
         except BenchmarkException as e:
             post_error_comment(e.message)
+        progress_comment.delete()
     else:
         print("  -> No benchmark needed\n")

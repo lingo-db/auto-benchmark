@@ -188,8 +188,6 @@ class Process:
                 elif data:
                         return data
 
-                #print(f"data: {data}")
-
                 # Check if the process has terminated
                 if self.process.poll() is not None:
                     raise ChildProcessError("process closed")
@@ -245,7 +243,7 @@ class Runner:
 
             if "execution:" in output and "compilation:" in output:
                 break
-            elif output.startswith("ERROR:"):
+            elif output.startswith("ERROR:") or output.startswith("what():"):
                 raise RuntimeError(f"Error executing query: {output}")
 
             output = None
@@ -297,8 +295,8 @@ with Runner() as runner:
                 results["queries"][query_file.replace(".sql","")] = {
                     "execution_times": execution_times,
                     "compilation_times": compilation_times,
-                    "execution_time_summary": f"{judged_execution_times.estimate_ms} ms ± {judged_execution_times.plus_minus_ms} ms",
-                    "compilation_time_summary":  f"{judged_compilation_times.estimate_ms} ms ± {judged_compilation_times.plus_minus_ms} ms",
+                    "execution_time_summary": f"{judged_execution_times.estimate_ms:.3f} ms\n± {judged_execution_times.plus_minus_ms:.3f} ms",
+                    "compilation_time_summary":  f"{judged_compilation_times.estimate_ms:.3f} ms\n± {judged_compilation_times.plus_minus_ms:.3f} ms",
                 }
                 break
 
