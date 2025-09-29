@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Any
 
 from podman.errors import ContainerError
 
@@ -7,7 +8,12 @@ from podman.errors import ContainerError
 class GitCheckoutInfo:
     repo_url :str
     commit_sha: str
+    repo: Any
 
+@dataclass
+class RunConfig:
+    db_base_dir: str
+    sql_binary: str
 
 def run_container(img : str, bash_cmd: str, mounts, podman_client):
     try:

@@ -1,3 +1,4 @@
+import math
 import re
 import time
 
@@ -49,9 +50,6 @@ def needs_benchmark(pr):
     return True, last_request
 
 
-# Retrieve all open pull requests
-open_prs = repo.get_pulls(state="open")
-
 
 def post_progress_comment(pr, req_comment, benchmark_config:BenchmarkConfig):
     return pr.create_issue_comment(
@@ -64,70 +62,112 @@ def post_progress_comment(pr, req_comment, benchmark_config:BenchmarkConfig):
     )
 
 
-from typing import Dict, List
+from typing import Dict, List, Tuple, Any, Sequence
 
 
-def _fmt_pct(factor: float, kind: str) -> str:
-    if kind == "speedup":
-        pct = (1 - factor) * 100  # factor < 1
-        return f"{pct:.2f}% speedup"
-    else:
-        pct = (factor - 1) * 100  # factor > 1
-        return f"{pct:.2f}% slowdown"
+def _format_pct(x: Any) -> str:
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return "n/a"
+    return f"{f:.2f}%"
 
+def _format_range(from_pct: Any, to_pct: Any) -> str:
+    return f"{_format_pct(from_pct)} - {_format_pct(to_pct)}"
 
-def _make_table(rows: List[Dict], kind: str) -> str:
+def _first_present(d: Dict[str, Any], keys: Sequence[str]) -> Dict[str, Any]:
+    for k in keys:
+        val = d.get(k)
+        if isinstance(val, dict):
+            return val
+    return {}
+
+def _collect_summary_and_tables(
+    queries: Dict[str, Any],
+    judgement_keys: Sequence[str],
+) -> Tuple[Dict[str, int], List[Tuple[str, float, float, float]], List[Tuple[str, float, float, float]]]:
+    """
+    Returns:
+      summary_counts: {"same": n, "undecided": n, "different": n}
+      table_speedups: list for faster == "B": (query_id, from_pct, to_pct, sort_metric)
+      table_slowdowns: list for faster == "A": (query_id, from_pct, to_pct, sort_metric)
+    sort_metric is max(|from|, |to|) for sorting by largest reported effect first.
+    """
+    counts = {"same": 0, "undecided": 0, "different": 0}
+    speedups: List[Tuple[str, float, float, float]] = []
+    slowdowns: List[Tuple[str, float, float, float]] = []
+
+    for qid, qdata in (queries or {}).items():
+        j = _first_present(qdata or {}, judgement_keys)
+        overall = str(j.get("overall", "")).lower()
+        faster = j.get("faster")
+        from_pct = j.get("from_pct")
+        to_pct = j.get("to_pct")
+
+        if overall in counts:
+            counts[overall] += 1
+
+        if overall == "different":
+            try:
+                f_from = float(from_pct)
+                f_to = float(to_pct)
+                sort_metric = max(abs(f_from), abs(f_to))
+            except (TypeError, ValueError):
+                f_from = math.nan
+                f_to = math.nan
+                sort_metric = -math.inf  # will sort last via key function below
+
+            row = (str(qid), f_from, f_to, sort_metric)
+            if faster == "B":
+                speedups.append(row)
+            elif faster == "A":
+                slowdowns.append(row)
+
+    # Sort by largest effect range first; NaNs last
+    def sort_key(t):
+        metric = t[3]
+        return (-(metric) if metric == metric else float("inf"), )  # NaN check: NaN != NaN
+
+    speedups.sort(key=sort_key)
+    slowdowns.sort(key=sort_key)
+
+    return counts, speedups, slowdowns
+
+def _render_table(rows: List[Tuple[str, float, float, float]], header: str) -> str:
     if not rows:
-        return "_None._\n"
+        return f"*No entries for {header.lower()}.*\n"
+    md = []
+    md.append(f"**{header}**")
+    md.append("")
+    md.append("| Query | Range (%) |")
+    md.append("|:-----:|:----------|")
+    for qid, f_from, f_to, _ in rows:
+        md.append(f"| `{qid}` | {_format_range(f_from, f_to)} |")
+    md.append("")
+    return "\n".join(md)
 
-    def score(it):
-        return abs(1 - float(it.get("factor", 1.0)))
+def _render_section(title: str, queries: Dict[str, Any], judgement_keys: Sequence[str]) -> str:
+    counts, speedups, slowdowns = _collect_summary_and_tables(queries, judgement_keys)
+    same = counts.get("same", 0)
+    undecided = counts.get("undecided", 0)
+    different = counts.get("different", 0)
 
-    rows_sorted = sorted(rows, key=score, reverse=True)
-
-    header = "| Query | Before | After | Change |\n|:-----:|:------:|:-----:|:------:|"
-    lines = [header]
-    for it in rows_sorted:
-        q = str(it.get("query", "—"))
-        before = str(it.get("before", "—"))
-        after = str(it.get("after", "—"))
-        f = float(it.get("factor", 1.0))
-        change = _fmt_pct(f, kind)
-        lines.append(f"| `{q}` | {before} | {after} | {change} |")
-    return "\n".join(lines) + "\n"
-
-
+    md = []
+    md.append(f"### {title}")
+    md.append("")
+    md.append(
+        f"**Summary:** {same} queries are *same*, {undecided} are *close*, and {different} are *different*."
+    )
+    md.append("")
+    md.append(_render_table(speedups, "Speedups"))
+    md.append(_render_table(slowdowns, "Slowdowns"))
+    return "\n".join(md)
 def _format_dataset(name: str, dataset: Dict) -> str:
-    parts = [f"## {name}\n",
-             "> Times shown as `before` → `after`. Change is computed from the reported factor.\n"]
+    parts = [f"## {name}\n"]
 
     for phase in ("compilation", "execution"):
-        section = dataset.get(phase)
-        if section is None:
-            continue
-
-        slow_rows = section.get("slowdown", []) or []
-        fast_rows = section.get("speedup", []) or []
-
-        parts.append(f"### {phase.capitalize()}")
-        if not slow_rows and not fast_rows:
-            parts.append("_No statistically significant changes._\n")
-            continue
-
-        if fast_rows:
-            parts.append("**🚀 Speedups**")
-            parts.append(_make_table(fast_rows, "speedup"))
-        else:
-            parts.append("**🚀 Speedups**\n_None._\n")
-
-        if slow_rows:
-            parts.append("**🐢 Slowdowns**")
-            parts.append(_make_table(slow_rows, "slowdown"))
-        else:
-            parts.append("**🐢 Slowdowns**\n_None._\n")
-
+        parts.append(_render_section(phase.title(), dataset, [f"judgement_{phase}"]))
     return "\n".join(parts)
-
 
 def format_benchmarks_markdown(results_by_dataset: Dict[str, Dict]) -> str:
     """
@@ -143,7 +183,7 @@ def format_benchmarks_markdown(results_by_dataset: Dict[str, Dict]) -> str:
     """
     chunks = []
     for name in sorted(results_by_dataset.keys()):
-        chunks.append(_format_dataset(name, results_by_dataset[name]))
+        chunks.append(_format_dataset(name, results_by_dataset[name]["queries"]))
     return "\n".join(chunks)
 
 
@@ -224,34 +264,38 @@ def parse_benchmark_args(s: str, config) -> BenchmarkConfig:
         datasets=datasets
     )
 
+while True:
+    # Retrieve all open pull requests
+    open_prs = repo.get_pulls(state="open")
 
-for pr in open_prs:
-    needs, req_comment = needs_benchmark(pr)
+    for pr in open_prs:
+        needs, req_comment = needs_benchmark(pr)
 
-    print(f"PR #{pr.number}: {pr.title}")
-    print(f"  - Head ref: {pr.head.ref}")
-    print(f"  - Head SHA: {pr.head.sha}")
-    print(f"  - Clone URL: {pr.head.repo.clone_url}")
-    print("Wants to merge into")
-    print(f"  - Base ref: {pr.base.ref}")
-    print(f"  - Base SHA: {pr.base.sha}")
-    print(f"  - Base clone URL: {pr.base.repo.clone_url}")
+        print(f"PR #{pr.number}: {pr.title}")
+        print(f"  - Head ref: {pr.head.ref}")
+        print(f"  - Head SHA: {pr.head.sha}")
+        print(f"  - Clone URL: {pr.head.repo.clone_url}")
+        print("Wants to merge into")
+        print(f"  - Base ref: {pr.base.ref}")
+        print(f"  - Base SHA: {pr.base.sha}")
+        print(f"  - Base clone URL: {pr.base.repo.clone_url}")
 
-    # Example git commands to fetch and checkout this PR locally:
-    print("  Git commands:")
-    print(f"    git fetch origin pull/{pr.number}/head:{pr.head.ref}")
-    print(f"    git checkout {pr.head.ref}")
-    # print(extract_catalog_version(repo, pr.head.sha))
-    # print(extract_container_image(repo, pr.head.sha))
-    if needs:
-        print(f"  -> Needs benchmark (requested at {req_comment.created_at.isoformat()})\n")
-        benchmark_config = parse_benchmark_args(req_comment.body.strip(), config)
-        progress_comment = post_progress_comment(pr, req_comment, benchmark_config)
-        try:
-            result = benchmark_pr(pr, benchmark_config, config)
-            post_results_comment(pr, result)
-        except BenchmarkException as e:
-            post_error_comment(e.message)
-        progress_comment.delete()
-    else:
-        print("  -> No benchmark needed\n")
+        # Example git commands to fetch and checkout this PR locally:
+        print("  Git commands:")
+        print(f"    git fetch origin pull/{pr.number}/head:{pr.head.ref}")
+        print(f"    git checkout {pr.head.ref}")
+        # print(extract_catalog_version(repo, pr.head.sha))
+        # print(extract_container_image(repo, pr.head.sha))
+        if needs:
+            print(f"  -> Needs benchmark (requested at {req_comment.created_at.isoformat()})\n")
+            benchmark_config = parse_benchmark_args(req_comment.body.strip(), config)
+            progress_comment = post_progress_comment(pr, req_comment, benchmark_config)
+            try:
+                result = benchmark_pr(pr, benchmark_config, config)
+                post_results_comment(pr, result)
+            except BenchmarkException as e:
+                post_error_comment(e.message)
+            progress_comment.delete()
+        else:
+            print("  -> No benchmark needed\n")
+    time.sleep(30)

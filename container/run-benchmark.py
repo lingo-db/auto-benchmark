@@ -16,111 +16,106 @@ from typing import List, Tuple
 import random
 import math
 import statistics as stats
+import numpy as np
+import scipy.stats as stats
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+from enum import Enum
+
+import numpy as np
+import scipy.stats as stats
+import math
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+from enum import Enum
 
 @dataclass
-class StabilityResult:
-    stable: bool
-    estimate_ms: float | None           # median runtime (ms) if stable, else None
-    plus_minus_ms: float | None         # CI half-width (ms) for reporting "x ms ± y ms"
-    ci_95: Tuple[float, float] | None   # (low, high) 95% CI for the median
-    n_input: int                        # number of samples provided
-    n_used: int                         # after outlier trimming
-    removed_outliers: int
-    cv_pct: float | None                # coefficient of variation (%) on trimmed data
-    mad_ms: float | None                # median absolute deviation (ms)
-    reason: str                         # short explanation
+class ComparisonResult:
+    overall: str # can be one of same, different, undecided
+    faster: str=None
+    from_pct: float=0.0
+    to_pct: float=0.0
 
-def _iqr_fences(xs: List[float], k: float = 1.5) -> Tuple[float, float]:
-    q1, q3 = _percentile(xs, 25), _percentile(xs, 75)
-    iqr = q3 - q1
-    return (q1 - k * iqr, q3 + k * iqr)
 
-def _percentile(xs: List[float], p: float) -> float:
-    # linear interpolation, inclusive method; no numpy dependency
-    if not xs:
-        raise ValueError("empty")
-    ys = sorted(xs)
-    r = (p/100) * (len(ys)-1)
-    i = int(math.floor(r))
-    j = int(math.ceil(r))
-    if i == j:
-        return ys[i]
-    frac = r - i
-    return ys[i] * (1-frac) + ys[j] * frac
 
-def _bootstrap_ci_median(xs: List[float], alpha: float = 0.05, B: int = 10_000, seed: int | None = 12345) -> Tuple[float,float]:
-    rng = random.Random(seed)
-    n = len(xs)
-    meds = []
-    for _ in range(B):
-        sample = [xs[rng.randrange(n)] for _ in range(n)]
-        meds.append(stats.median(sample))
-    meds.sort()
-    lo_idx = int((alpha/2) * B)
-    hi_idx = int((1 - alpha/2) * B) - 1
-    return (meds[lo_idx], meds[hi_idx])
+def compare_runtimes(
+    v1, v2, *,
+    effect_threshold=0.02,   # practical significance (e.g., ±5%)
+    alpha=0.05,              # 1 - confidence (0.05 -> 95% CI)
+    n_boot=5000,
+    random_state=0,
+    return_message=True
+)->ComparisonResult:
+    """
+    Compare runtimes using a bootstrap CI for the *relative* difference in means.
 
-def judge_stability(
-    times_ms: List[float],
-    *,
-    min_runs: int = 6,
-    rel_tol: float = 0.02,         # 2% relative half-width target
-    abs_tol_ms: float = 0.10,      # or ≤ 0.10 ms absolute half-width
-    fence_k: float = 1.5,          # Tukey fence multiplier
-    alpha: float = 0.05,
-    bootstrap_B: int = 10_000,
-    bootstrap_seed: int | None = 12345
-) -> StabilityResult:
-    """Return whether runtimes are stable enough and a robust estimate if so."""
-    xs = [float(x) for x in times_ms if math.isfinite(x) and x > 0]
-    n_input = len(xs)
-    if n_input < 2:
-        return StabilityResult(False, None, None, None, n_input, n_input, 0, None, None,
-                               "Need ≥2 positive samples")
+    Relative difference is defined as:
+        rel = (mean(v2) - mean(v1)) / ((mean(v1) + mean(v2)) / 2)
+    Interpretation:
+        rel > 0  -> Version 1 is faster (v2 has higher runtime)
+        rel < 0  -> Version 2 is faster
+        rel ~ 0  -> similar
 
-    # Trim extreme outliers (helps on noisy hosts)
-    lo, hi = _iqr_fences(xs, fence_k)
-    trimmed = [x for x in xs if lo <= x <= hi]
-    removed = n_input - len(trimmed)
-    if len(trimmed) < 2:
-        # if trimming nuked everything, fall back to raw
-        trimmed = xs
-        removed = 0
+    Decision logic (based on CI vs effect_threshold):
+      - hi < -effect_threshold        -> "Version 2 is faster"
+      - lo >  +effect_threshold       -> "Version 1 is faster"
+      - [-thr, +thr] fully contains CI-> "Both versions are basically the same..."
+      - otherwise                     -> "Please add more runs..."
 
-    n = len(trimmed)
-    if n < min_runs:
-        return StabilityResult(False, None, None, None, n_input, n, removed, None, None,
-                               f"Need ≥{min_runs} runs after trimming; have {n}")
+    Returns:
+        dict with:
+          verdict: str
+          point: float                 # relative difference (e.g., -0.08 = 8% faster for v2)
+          ci: (lo, hi)                 # CI for relative difference
+          mean_v1, mean_v2: float
+          n_v1, n_v2: int
+          message: str (optional)      # formatted human-readable summary
+    """
+    v1 = np.asarray(v1, dtype=float)
+    v2 = np.asarray(v2, dtype=float)
 
-    median = stats.median(trimmed)
-    mad = stats.median([abs(x - median) for x in trimmed])  # robust spread in ms
+    if np.any(~np.isfinite(v1)) or np.any(~np.isfinite(v2)):
+        raise ValueError("Inputs must be finite numbers.")
+    if len(v1) < 2 or len(v2) < 2:
+        return ComparisonResult(overall="undecided")
 
-    # For diagnostics only: CV on trimmed data (uses mean/std, not for decision)
-    mean = stats.fmean(trimmed)
-    stdev = stats.pstdev(trimmed) if n > 1 else 0.0
-    cv_pct = (stdev / mean * 100.0) if mean > 0 else None
+    def rel_diff(a, b):
+        ma, mb = np.mean(a), np.mean(b)
+        denom = (ma + mb) / 2.0
+        return 0.0 if denom == 0 else (mb - ma) / denom
 
-    # Bootstrap 95% CI for the median
-    ci_lo, ci_hi = _bootstrap_ci_median(trimmed, alpha=alpha, B=bootstrap_B, seed=bootstrap_seed)
-    half_width = (ci_hi - ci_lo) / 2.0
+    point = rel_diff(v1, v2)
 
-    # Decision: accept if CI half-width is small enough relative to estimate or absolutely
-    rel_ok = (median > 0) and (half_width / median <= rel_tol)
-    abs_ok = (half_width <= abs_tol_ms)
+    # Bootstrap CI
+    rng = np.random.default_rng(random_state)
+    n1, n2 = len(v1), len(v2)
+    idx1 = rng.integers(0, n1, size=(n_boot, n1))
+    idx2 = rng.integers(0, n2, size=(n_boot, n2))
 
-    if rel_ok or abs_ok:
-        return StabilityResult(True, median, half_width, (ci_lo, ci_hi), n_input, n, removed, cv_pct, mad,
-                               f"Stable: half-width {half_width:.4f} ms (rel {half_width/median*100:.2f}%); "
-                               f"n={n}, outliers removed={removed}")
+    m1b = v1[idx1].mean(axis=1)
+    m2b = v2[idx2].mean(axis=1)
+    denom = (m1b + m2b) / 2.0
+    safe = denom != 0
+    boots = np.empty(n_boot, dtype=float)
+    boots[~safe] = 0.0
+    boots[safe] = (m2b[safe] - m1b[safe]) / denom[safe]
+
+    lo = float(np.quantile(boots, alpha/2))
+    hi = float(np.quantile(boots, 1 - alpha/2))
+    lo_pct, hi_pct = lo * 100.0, hi * 100.0  # numeric for comparisons
+
+    # Decision
+    # Decision
+    if hi < -effect_threshold:
+        return ComparisonResult(overall="different", faster="B", from_pct=abs(hi_pct), to_pct=abs(lo_pct))
+    elif lo > effect_threshold:
+        return ComparisonResult(overall="different", faster="A",from_pct=lo_pct, to_pct=hi_pct)
+    elif (-effect_threshold <= lo) and (hi <= effect_threshold):
+        verdict = "Both versions are basically the same runtime (except for noise)"
+        return ComparisonResult(overall="same")
     else:
-        # Give a concrete suggestion for more runs: estimate needed n scaling for width ~ 1/sqrt(n)
-        # Bootstrap CI width tends to shrink ~sqrt(n); propose multiplier to hit target
-        target_half = max(rel_tol * median, abs_tol_ms)
-        suggested_n = math.ceil(n * (half_width / target_half) ** 2)
-        suggested_n = max(suggested_n, n + 2)  # at least a few more
-        return StabilityResult(False, None, None, (ci_lo, ci_hi), n_input, n, removed, cv_pct, mad,
-                               f"Not stable: half-width {half_width:.4f} ms (rel {half_width/median*100:.2f}%). "
-                               f"Try ~{suggested_n} total runs.")
+        return ComparisonResult(overall="undecided")
+
 
 
 
@@ -209,22 +204,26 @@ class Process:
 
         return ret.stdout
 
-
-if len(sys.argv) != 6:
+print(sys.argv)
+if len(sys.argv) != 7:
     print("Usage: python run-lingodb.py <db_base_dir> <dataset> <queries_dir> <execution_mode> <output_file>")
     sys.exit(1)
 
-db_base_dir = sys.argv[1]
-dataset = sys.argv[2]
-queries_dir = sys.argv[3]
-execution_mode = sys.argv[4]
-output_file = sys.argv[5]
+db_base_dir_a = sys.argv[1]
+db_base_dir_b = sys.argv[2]
+dataset = sys.argv[3]
+queries_dir = sys.argv[4]
+execution_mode = sys.argv[5]
+output_file = sys.argv[6]
 
 class Runner:
+    def __init__(self, binary_name, db_base_dir):
+        self.binary_name = binary_name
+        self.db_base_dir = db_base_dir
     def __enter__(self):
-        self.process = Process(f"taskset --cpu-list 0-7 sql {db_base_dir}/{dataset}",
+        self.process = Process(f"taskset --cpu-list 1-7 {self.binary_name} {self.db_base_dir}/{dataset}",
                                {"LINGODB_EXECUTION_MODE": execution_mode, "LINGODB_SQL_PROMPT": "0",
-                                "LINGODB_SQL_REPORT_TIMES": "1", "LINGODB_PARALLELISM": "8"})
+                                "LINGODB_SQL_REPORT_TIMES": "1", "LINGODB_PARALLELISM": "7"})
         self.process.start()
         return self
 
@@ -262,7 +261,20 @@ class Runner:
 results={}
 results["dataset"] = dataset
 results["queries"] = {}
-with Runner() as runner:
+
+def execute_query_on_runner(runner, query):
+    for _ in range(3):  # 3 warmup runs
+        runner.execute(query)
+    execution_times = []
+    compilation_times = []
+    for i in range(10):
+        execution_time, compilation_time, client_total = runner.execute(query)
+        # print(f"Run: Execution Time: {execution_time} ms\nCompilation Time: {compilation_time} ms\nClient Total Time: {client_total} ms\n")
+        execution_times.append(execution_time)
+        compilation_times.append(compilation_time)
+
+    return execution_times, compilation_times
+with Runner("sqla", db_base_dir_a) as runnera, Runner("sqlb", db_base_dir_b) as runnerb:
     for query_file in os.listdir(queries_dir):
         if "initialize" in query_file:
             continue
@@ -274,32 +286,75 @@ with Runner() as runner:
         if not query.strip().endswith(';'):
             query += ';'
         query += "\n"  # ensure a newline at the end
-        for _ in range(3):  # 3 warmup runs
-            runner.execute(query)
-        execution_times = []
-        compilation_times = []
-        for i in range(200):
-            execution_time, compilation_time, client_total = runner.execute(query)
-            # print(f"Run: Execution Time: {execution_time} ms\nCompilation Time: {compilation_time} ms\nClient Total Time: {client_total} ms\n")
-            execution_times.append(execution_time)
-            compilation_times.append(compilation_time)
-            judged_execution_times = judge_stability(
-                execution_times,
-                rel_tol=0.02,
-            )
-            judged_compilation_times = judge_stability(
-                compilation_times,
-                rel_tol=0.02,
-            )
-            if judged_execution_times.stable and judged_compilation_times.stable:
-                results["queries"][query_file.replace(".sql","")] = {
-                    "execution_times": execution_times,
-                    "compilation_times": compilation_times,
-                    "execution_time_summary": f"{judged_execution_times.estimate_ms:.3f} ms\n± {judged_execution_times.plus_minus_ms:.3f} ms",
-                    "compilation_time_summary":  f"{judged_compilation_times.estimate_ms:.3f} ms\n± {judged_compilation_times.plus_minus_ms:.3f} ms",
+        print(query_file)
+        execution_times_a = []
+        compilation_times_a = []
+        execution_times_b = []
+        compilation_times_b = []
+        executionTimesObservedSpeedup = False
+        compilationTimesObservedSpeedup = False
+        for i in range(10):
+            et_a, ct_a = execute_query_on_runner(runnera, query)
+            et_b, ct_b = execute_query_on_runner(runnerb, query)
+            execution_times_a+=et_a
+            compilation_times_a+=ct_a
+            execution_times_b+=et_b
+            compilation_times_b+=ct_b
+            # Initialize analyzer
+            compared_execution_times= compare_runtimes(execution_times_a, execution_times_b)
+            compared_compilation_times= compare_runtimes(compilation_times_a, compilation_times_b)
+            needs_round = False
+            if compared_execution_times.overall=="undecided" or compared_compilation_times.overall=="undecided":
+                needs_round = True
+            if compared_execution_times=="different" and not executionTimesObservedSpeedup:
+                needs_round = True
+            if compared_compilation_times=="different" and not compilationTimesObservedSpeedup:
+                needs_round = True
+
+            if not needs_round or i == 9:
+                results["queries"][query_file.replace(".sql", "")] = {
+                    "raw":{
+                    "execution_times_a": execution_times_a,
+                    "execution_times_b": execution_times_b,
+                    "compilation_times_a": compilation_times_a,
+                    "compilation_times_b": compilation_times_b,
+                    },
+                    "judgement_execution": {"overall": compared_execution_times.overall, "faster": compared_execution_times.faster, "from_pct": compared_execution_times.from_pct, "to_pct": compared_execution_times.to_pct},
+                    "judgement_compilation": {"overall": compared_compilation_times.overall, "faster": compared_compilation_times.faster, "from_pct": compared_compilation_times.from_pct, "to_pct": compared_compilation_times.to_pct}
                 }
                 break
+execution_same=0
+execution_fasterA=0
+execution_fasterB=0
+execution_undecided=0
+compilation_same=0
+compilation_fasterA=0
+compilation_fasterB=0
+compilation_undecided=0
+for k,v in results["queries"].items():
+    judgement_execution=v["judgement_execution"]
+    judgement_compilation=v["judgement_compilation"]
+    execution_same+= judgement_execution["overall"]=="same"
+    execution_fasterA+= judgement_execution["faster"]=="A"
+    execution_fasterB+= judgement_execution["faster"]=="B"
+    execution_undecided+= judgement_execution["overall"]=="undecided"
+    compilation_same+= judgement_compilation["overall"]=="same"
+    compilation_fasterA+= judgement_compilation["faster"]=="A"
+    compilation_fasterB+= judgement_compilation["faster"]=="B"
+    compilation_undecided+= judgement_compilation["overall"]=="undecided"
 
+
+print("Execution:")
+print("Same", execution_same)
+print("A Faster", execution_fasterA)
+print("B Faster", execution_fasterA)
+print("Undecided", execution_undecided)
+
+print("Compilation:")
+print("Same", compilation_same)
+print("A Faster", compilation_fasterA)
+print("B Faster", compilation_fasterA)
+print("Undecided", compilation_undecided)
 # write results to file
 with open(output_file, 'w') as f:
     json.dump(results, f)
